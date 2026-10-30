@@ -1,68 +1,54 @@
 # Unified State
 
-Unified State is a C++17, header-only library for publishing and querying
-estimator output on a causally consistent timeline. It is designed for systems
-where several consumers need the same state history: association, planning,
-control, diagnostics, replay, and logging.
+Unified State 是一个 C++17、纯头文件的状态发布与历史查询基础库，用于把估计器输出放到一条具备因果语义的时间轴上。它面向需要共享同一份状态历史的系统，例如数据关联、规划、控制、诊断、回放和日志。
 
-The library is estimator-agnostic. It contains no EKF, FGO, armor model,
-detector, camera model, OpenCV, Eigen, ROS, or project-specific state
-definition. The caller defines `State`; the timeline owns its temporal and
-publication contract.
+本库与具体估计器无关，不包含 EKF、FGO、装甲模型、检测器、相机模型、OpenCV、Eigen、ROS 或任何项目专用状态定义。调用方负责定义 `State`，Unified State 负责状态的时序、历史和发布契约。
 
-> Unified State is a state-contract and history layer, not another estimator.
+> Unified State 是状态契约与历史管理层，不是另一个估计器。
 
-## Why this layer exists
+## 为什么需要这一层
 
-Passing the newest struct between threads is usually not enough. A consumer
-also needs to know:
+只在模块之间传递“最新结构体”通常不够。消费者还需要知道：
 
-- which physical instant the state describes;
-- when every input needed to reproduce that state became available;
-- whether the state came from an observation, motion-only propagation, or a
-  read-only prediction;
-- which tracking session it belongs to;
-- which source revision and reset epoch it came from;
-- whether a historical query is offline analysis or an online causal query;
-- which prediction model produced a future value.
+- 这份状态描述的是哪个物理时刻；
+- 复现该状态所需的全部信息在什么时刻才真正可用；
+- 状态来自观测支持的后验、仅运动传播，还是只读预测；
+- 状态属于哪一次跟踪会话；
+- 状态来自哪个源修订号以及哪一次 reset 生命周期；
+- 一次历史查询用于离线分析还是在线因果查询；
+- 未来状态由哪个预测模型产生。
 
-When those questions are implicit, modules tend to timestamp the same state
-differently, consume results before they are available, reuse predictions as
-observations, or interpolate across target switches. Unified State makes those
-failure modes explicit and testable.
+当这些信息没有显式建模时，各模块容易给同一份状态打上不同时间戳、使用尚未可用的结果、把预测结果重新当作观测历史，或者在不同目标之间进行插值。Unified State 将这些失败模式转换为明确约束，并通过测试验证。
 
-## Architecture
+## 架构
 
 ```mermaid
 flowchart LR
-    E[Estimator or state source] --> U[StateUpdate&lt;State&gt;]
-    U --> T[StateTimeline&lt;State&gt;]
+    E["估计器或状态源"] --> U["StateUpdate&lt;State&gt;"]
+    U --> T["StateTimeline&lt;State&gt;"]
 
-    T --> H[Bounded causal history]
-    H --> X[Exact or interpolated history]
-    H --> M[Causal measurement lookup]
+    T --> H["有界因果历史"]
+    H --> X["精确或插值历史查询"]
+    H --> M["因果测量查询"]
 
-    T --> P[Read-only prediction]
-    T --> S[SharedTimeline&lt;State&gt;]
-    S --> L[Immutable latest snapshot]
-    S --> C[Causal control prediction]
+    T --> P["只读预测"]
+    T --> S["SharedTimeline&lt;State&gt;"]
+    S --> L["不可变 latest 快照"]
+    S --> C["因果控制预测"]
 
-    X --> A[Association, diagnostics, replay]
+    X --> A["数据关联、诊断、回放"]
     M --> A
-    L --> R[Planning and control readers]
+    L --> R["规划与控制读取方"]
     C --> R
 ```
 
-The data path has one write model and two query models:
+数据路径由一个写入模型和两类查询模型组成：
 
-1. **Recorded history** is append-only, bounded, and strictly ordered by
-   physical event time within one tracking session.
-2. **Read-only derivation** produces interpolated or predicted values without
-   inserting them into history.
-3. **Snapshot publication** gives one writer and multiple readers a coherent,
-   immutable latest value without exposing the history container.
+1. **已记录历史**：在同一个跟踪会话内，按物理事件时间严格有序、只追加、有容量上限。
+2. **只读派生**：插值和预测结果按需生成，不会写回历史。
+3. **快照发布**：为单写多读场景提供一致且不可变的 latest 状态，读取方不直接访问历史容器。
 
-## Core contracts
+## 核心契约
 
 ### `Timestamp`
 
@@ -73,9 +59,7 @@ struct Timestamp {
 };
 ```
 
-Time is an explicit integer nanosecond value in a caller-defined clock domain.
-The library never calls a system clock. Comparisons across clock domains are
-rejected with `QueryError::clock_mismatch`.
+时间由整数纳秒和调用方定义的时钟域组成。本库不会主动调用系统时钟。不同时钟域之间不能直接比较，否则返回 `QueryError::clock_mismatch`。
 
 ### `StateUpdate<State>`
 
@@ -91,27 +75,21 @@ struct StateUpdate {
 };
 ```
 
-`state_time` is the physical instant represented by the state.
-`available_time` is the first instant at which all inputs needed to reproduce
-that state were available. If omitted, it defaults to `state_time`; online
-pipelines should normally provide the real availability time.
+`state_time` 是该状态描述的物理时刻。`available_time` 是复现该状态所需的全部输入第一次真正可用的时刻。若未提供，则默认等于 `state_time`；在线管线通常应显式填写实际可用时间。
 
-`measurement_backed` is an upstream assertion. It means that the state is
-supported by an observation. Motion-only propagation sets it to `false`.
+`measurement_backed` 是上游给出的明确断言：状态受到当前观测支持。仅运动传播的状态应将其设为 `false`。
 
 ### `State`
 
-`State` is a caller-defined copy- and move-constructible value. It may contain:
+`State` 是调用方定义、可拷贝且可移动的值类型，可以包含：
 
-- a mean and covariance;
-- discrete physical-identity or slot hypotheses;
-- observation-quality metadata;
-- coordinate-frame identifiers;
-- estimator-specific geometric quantities.
+- 均值和协方差；
+- 离散的物理身份或槽位假设；
+- 观测质量元数据；
+- 坐标系标识；
+- 估计器专用的几何量。
 
-The timeline stores and returns `State` without interpreting or mutating it.
-For this reason, covariance conventions and angle wrapping must be implemented
-by the caller's policies and adapters.
+Unified State 只负责存储和返回 `State`，不会解释或修改其中的数值。因此，角度归一化、协方差约定和状态传播必须由调用方提供的策略或适配器实现。
 
 ### `SessionKey`
 
@@ -123,81 +101,67 @@ struct SessionKey {
 };
 ```
 
-A session identifies one uninterrupted tracking episode. `domain` namespaces
-equal numeric values produced by different subsystems.
+Session 表示一次连续、没有发生重置的跟踪过程。`domain` 用于隔离不同子系统产生的相同数值。
 
-A detector class ID, armor number, or relative slot label is not a session key.
-The library prevents implicit session changes but does not decide whether two
-observations belong to the same physical object. That is an upstream
-association responsibility.
+检测类别 ID、装甲编号或相对槽位标签都不能直接作为 session key。本库可以阻止隐式 session 切换，但无法决定两个观测是否属于同一个物理对象；这仍然属于上游数据关联的职责。
 
 ### `StateSnapshot<State>`
 
-A snapshot adds provenance to a state:
+快照在状态值之外保留来源信息：
 
 ```text
-state_time        represented physical time
-anchor_time       prediction anchor or upper record for interpolation
-available_time    input availability of the source record
-revision          source-record revision, not a new derived revision
-epoch             reset lifecycle generation
+state_time        状态所描述的物理时刻
+anchor_time       预测使用的锚点，或插值使用的上界记录
+available_time    来源记录的信息可用时间
+revision          来源记录的修订号，不是派生结果的新修订号
+epoch             reset 生命周期编号
 source            posterior | motion_only | interpolated | predicted
-session           tracking-session identity
+session           跟踪会话身份
 measurement_backed
 coast_frames
-state             caller-defined value
+state             调用方定义的状态值
 ```
 
-Predictions and interpolations are generated query results. They do not append
-to history and do not consume a new `revision`.
+预测和插值都是查询时生成的派生结果，不会追加到历史，也不会消耗新的 `revision`。
 
-## Timeline guarantees
+## 时间轴保证
 
-Within a `StateTimeline`:
+在同一个 `StateTimeline` 内：
 
-- `state_time` must be strictly increasing;
-- `available_time` cannot precede `state_time` for a recorded update;
-- one timeline has one active clock domain and one active session;
-- a clock or session change requires an explicit `reset()`;
-- interpolation only occurs between records from the same session and within
-  `max_interpolation_gap`;
-- `exactAt()` and `interpolateAt()` never extrapolate;
-- predictions respect `max_prediction_horizon`;
-- predictions never mutate recorded history;
-- history is bounded by `max_history`;
-- `reset()` clears history, increments `epoch`, and restarts revision numbering.
+- `state_time` 必须严格递增；
+- 记录更新时，`available_time` 不能早于 `state_time`；
+- 一条时间轴只能有一个活动时钟域和一个活动 session；
+- 时钟域或 session 发生变化时，必须显式调用 `reset()`；
+- 只允许在相同 session 且不超过 `max_interpolation_gap` 的相邻记录之间插值；
+- `exactAt()` 和 `interpolateAt()` 不会外推；
+- 预测必须满足 `max_prediction_horizon`；
+- 预测不会修改已记录历史；
+- 历史长度受 `max_history` 限制；
+- `reset()` 清空历史、递增 `epoch`，并从 1 重新开始 `revision`。
 
-The normalized maximum history is at least one record. A zero value therefore
-creates a latest-only timeline.
+配置后的最大历史长度至少为 1。将 `max_history` 设为 0 等价于只保留 latest 记录。
 
-## Query semantics
+## 查询语义
 
-Different consumers require different definitions of "at or before".
+不同消费者需要不同的“在目标时刻或之前”定义。
 
-| API | Event-time rule | Availability rule | Intended use |
+| API | 事件时间规则 | 可用时间规则 | 典型用途 |
 | --- | --- | --- | --- |
-| `exactAt(t)` | exact `t` | none | deterministic replay/debug |
-| `interpolateAt(t)` | enclosing records | none | offline analysis |
-| `measurementAtOrBefore(t, age)` | event time `<= t` | none | offline association |
-| `causalMeasurementAtOrBefore(now, age)` | event time `<= now` | `available_time <= now` | online association |
-| `predictAt(t)` | anchor event time `<= t` | none | planned/offline forecast |
-| `predictForControl(now, latency)` | latest anchor | none | latency-compensated query |
-| `predictCausallyForControl(now, age, latency)` | latest measurement | available by `now` | online control |
+| `exactAt(t)` | 精确等于 `t` | 不检查 | 确定性回放和调试 |
+| `interpolateAt(t)` | 使用两侧包围记录 | 不检查 | 离线分析 |
+| `measurementAtOrBefore(t, age)` | 事件时间 `<= t` | 不检查 | 离线数据关联 |
+| `causalMeasurementAtOrBefore(now, age)` | 事件时间 `<= now` | `available_time <= now` | 在线数据关联 |
+| `predictAt(t)` | 锚点事件时间 `<= t` | 不检查 | 规划或离线预测 |
+| `predictForControl(now, latency)` | 使用 latest 锚点 | 不检查 | 延迟补偿查询 |
+| `predictCausallyForControl(now, age, latency)` | 使用 latest 测量锚点 | 必须在 `now` 前可用 | 在线控制 |
 
-`predictCausallyForControl()` uses the latest measurement-backed state as its
-anchor. A later motion-only state may remain visible through `latest()`, while
-the last observation anchor remains available through `latestMeasurement()`.
-The result is predicted for `now + downstream_latency`, and the latency is
-added exactly once.
+`predictCausallyForControl()` 使用最近一次受观测支持的状态作为锚点。较新的仅运动传播状态可以通过 `latest()` 看到，而最近一次观测锚点仍可通过 `latestMeasurement()` 获取。输出状态预测到 `now + downstream_latency`，且下游延迟只累加一次。
 
-For a predicted snapshot, `state_time` can be later than `available_time`.
-That is intentional: the represented future instant is not the instant at
-which its inputs became known.
+对于预测快照，`state_time` 可能晚于 `available_time`。这是有意设计的：预测所表示的未来物理时刻，与生成该预测的输入首次可用时刻并不是同一个概念。
 
-## Errors
+## 错误语义
 
-Queries return `QueryResult<State>` so callers can distinguish normal absence
-from a contract violation:
+查询返回 `QueryResult<State>`，调用方可以区分普通的数据不存在与契约错误：
 
 - `invalid_input`
 - `clock_mismatch`
@@ -214,81 +178,61 @@ from a contract violation:
 - `measurement_not_found`
 - `anchor_too_old`
 
-The string conversion `toString(QueryError)` is intended for logs and tests.
+`toString(QueryError)` 主要用于日志和测试。
 
-## Interpolation and prediction
+## 插值与预测
 
-Models are injected as functions:
+模型通过函数注入：
 
 ```cpp
 TimelinePolicy<State> policy;
 policy.interpolate = [](const State& a, const State& b, double alpha)
-    -> std::optional<State> { /* caller model */ };
+    -> std::optional<State> { /* 调用方模型 */ };
 policy.predict = [](const State& anchor, Nanoseconds dt)
-    -> std::optional<State> { /* caller model */ };
+    -> std::optional<State> { /* 调用方模型 */ };
 ```
 
-This keeps coordinate conventions, yaw wrapping, covariance propagation, and
-process noise outside the core. A policy may return `std::nullopt` to report
-that it cannot answer a query.
+这样可以把坐标约定、yaw 环绕、协方差传播和过程噪声保留在本库之外。策略可以返回 `std::nullopt`，表示当前模型无法回答该查询。
 
-The model-name strings in `TimelinePolicy` are descriptive metadata for the
-owner of the policy. They are not interpreted by the library.
+`TimelinePolicy` 中的模型名称字符串只用于描述策略，Unified State 不会解释这些字符串。
 
-## Concurrency model
+## 并发模型
 
-`StateTimeline<State>` is not internally synchronized. It is intended for a
-single-threaded owner or for callers that provide their own synchronization.
+`StateTimeline<State>` 内部不提供同步保护，适用于单线程所有者，或由调用方自行提供同步。
 
-`SharedTimeline<State>` provides single-writer/multiple-reader publication:
+`SharedTimeline<State>` 提供单写多读发布：
 
-- exactly one thread may call `record()` and `reset()`;
-- any number of threads may call `latest()`, `latestMeasurement()`,
-  `predictAt()`, `predictCausallyForControl()`, and metadata accessors;
-- readers receive a `std::shared_ptr<const StateSnapshot<State>>`;
-- the writer publishes an immutable snapshot; readers never access the history
-  deque or its mutex-equivalent state;
-- measurement-backed publication is made visible before the corresponding
-  latest publication.
+- 只能由同一个写线程调用 `record()` 和 `reset()`；
+- 任意多个线程可以调用 `latest()`、`latestMeasurement()`、`predictAt()`、`predictCausallyForControl()` 和元数据读取接口；
+- 读取方获得 `std::shared_ptr<const StateSnapshot<State>>`；
+- 写方发布不可变快照，读取方不会访问历史 deque；
+- 对测量支持的快照，先发布测量锚点，再发布 latest，避免读取方看到“latest 已存在但测量锚点尚未发布”的首次发布窗口。
 
-Atomic `shared_ptr` operations are thread-safe but are not claimed to be
-lock-free by the C++ standard. A reader holding a snapshot keeps that snapshot
-alive until the pointer is released.
+原子 `shared_ptr` 操作具备线程安全性，但 C++ 标准不保证其底层实现是无锁的。读取方持有快照期间，会保持该快照对象的生命周期。
 
-`State` must not hide mutable storage shared between snapshots. Use value
-semantics or immutable shared payloads so that a published snapshot cannot be
-modified after publication.
+`State` 不应隐藏被多个快照共享且可变的存储。应使用值语义或不可变共享载荷，确保快照发布后不会被修改。
 
-## Identity and semantic ambiguity
+## 身份与语义歧义
 
-The library separates temporal/session identity from domain identity:
+本库把时间/会话身份与业务领域身份分开：
 
 ```text
-SessionKey                 one tracking episode
-State                      caller-defined physical identity and hypotheses
-StateSource                broad provenance category
-measurement_backed         observation support
-TimelinePolicy             interpolation and prediction discipline
+SessionKey                 一次跟踪会话
+State                      调用方定义的物理身份与假设
+StateSource                粗粒度来源类别
+measurement_backed         是否有观测支持
+TimelinePolicy             插值与预测规则
 ```
 
-This boundary is deliberate. A numeric class ID can select an armor class
-without identifying the front, rear, left, or right physical face. Likewise, a
-relative model slot can be useful diagnostic metadata without being a stable
-target identity.
+这个边界是有意保留的。数值类别 ID 可以说明目标属于哪个兵种，但不能说明当前看到的是前、后、左、右哪一块物理装甲板。同样，相对模型槽位可以作为诊断信息，但不应被当作稳定的目标身份。
 
-Applications that have multiple slot hypotheses should keep those hypotheses
-discrete inside `State` or a layer around this library. The timeline will not
-silently convert them into one continuous scalar weight. The caller's
-association layer remains responsible for deciding which observation belongs
-to which physical object and for preserving the evidence behind that decision.
+如果应用存在多个物理槽位假设，应将这些假设以离散形式保存在 `State` 或外层模块中。Unified State 不会把它们隐式压缩为一个连续权重。观测与物理对象的关联、证据保留以及分支仲裁仍由调用方的数据关联层负责。
 
-Each active physical target should own a distinct timeline. A target switch is
-an explicit new timeline or `reset(ResetReason::session_switch)`, never an
-implicit change hidden inside `record()`.
+每个活动物理目标应拥有独立的时间轴。目标切换必须显式创建新时间轴，或调用 `reset(ResetReason::session_switch)`，不能在 `record()` 中隐式完成。
 
-## Integrating a state source
+## 接入状态源
 
-An adapter only needs to translate one estimator result:
+适配器只需要转换一次估计器结果：
 
 ```text
 ExternalEstimate
@@ -296,121 +240,89 @@ ExternalEstimate
     -> StateTimeline::record()
 ```
 
-The adapter should:
+适配器应完成以下工作：
 
-1. preserve the actual event and availability timestamps;
-2. assign a meaningful session key;
-3. copy the selected mean, covariance, and domain metadata;
-4. state explicitly whether an observation backed the result;
-5. convert coordinates once, before recording.
+1. 保留真实的事件时间和信息可用时间；
+2. 分配有意义的 session key；
+3. 拷贝需要的均值、协方差和领域元数据；
+4. 明确说明当前结果是否受观测支持；
+5. 在记录前只做一次坐标转换。
 
-Consumers should query the timeline rather than maintaining private,
-untimestamped copies of steering or target state. Offline algorithms use the
-offline query family; online association must use the causal query family.
+消费者应从统一时间轴查询状态，而不是各自缓存一份没有时间语义的云台、火控或目标状态。离线算法使用离线查询接口，在线数据关联必须使用因果查询接口。
 
-### What adaptation can improve
+### 接入后可以获得的收益
 
-The main benefits are architectural and operational:
+主要收益来自架构和运行时语义：
 
-- **One temporal contract:** all consumers use the same event time,
-  availability time, source, revision, and reset epoch.
-- **Causal correctness:** online queries can no longer use a state that was not
-  available at query time.
-- **Explicit target lifecycle:** revision and epoch changes make resets and
-  target switches visible instead of silently reusing stale history.
-- **Replayable history:** exact and interpolated queries use the same bounded
-  record set as online consumers.
-- **Narrower consumer contracts:** adapters can expose only the quantities a
-  consumer needs instead of leaking a full estimator object.
-- **Cheaper multi-reader handoff:** immutable snapshot reads avoid copying the
-  entire history or control payload in each consumer.
-- **Better diagnostics:** query errors distinguish stale anchors, unavailable
-  futures, model gaps, and association-session mismatches.
+- **统一时间契约**：所有消费者使用相同的事件时间、可用时间、来源、修订号和 reset epoch。
+- **保证在线因果性**：在线查询不能使用查询时刻尚未可用的状态。
+- **显式目标生命周期**：revision 和 epoch 使 reset、目标切换和旧状态失效变得可见。
+- **可回放历史**：在线消费者和离线分析使用同一份有界记录及相同的查询约束。
+- **收窄消费者契约**：适配器只暴露消费者需要的量，避免整个估计器对象泄漏到所有模块。
+- **更轻的多读取方交接**：不可变快照读取避免每个消费者都深拷贝控制载荷或完整历史。
+- **增强诊断能力**：查询错误可以区分锚点过期、未来信息、模型缺口和会话不匹配。
 
-It does not improve raw sensor frame rate, detector accuracy, association
-accuracy, or physical armor-slot observability by itself.
+它本身不会提高原始传感器帧率、检测精度、数据关联精度或物理装甲槽位的可观测性。
 
-## About an 11-state to 8-state projection
+## 关于 11 维状态到 8 维状态的投影
 
-Unified State does not transform an 11-state estimator into an 8-state
-estimator. A caller-side adapter can project a selected subset at the snapshot
-boundary. For example:
+Unified State 不会把 11 维估计器转换成 8 维估计器。调用方适配器可以在快照边界对选定子空间做投影，例如：
 
 ```text
 mu8      = S * mu11
 Sigma8   = S * Sigma11 * S^T
 ```
 
-If `S` is a linear selection matrix, the selected mean and marginal covariance
-are exact at that instant. This avoids introducing a second filter and avoids
-inventing covariance values that the source did not provide.
+如果 `S` 是线性选择矩阵，那么在该快照时刻，选定的均值和边缘协方差是精确的。这种方式不引入第二个滤波器，也不会虚构源估计器没有提供的协方差。
 
-It does not make an 8-dimensional predictor generally equivalent to an
-11-dimensional predictor. Discarded geometry can affect later propagation,
-interpolation, and process noise. Equivalence and accuracy must be established
-with an unchanged-input replay A/B test against the original estimator.
+但这不意味着 8 维预测器在所有情况下都与 11 维预测器等价。被删除的几何量可能影响后续传播、插值和过程噪声。等价性与精度必须通过相同输入的逐帧回放 A/B 实验验证。
 
-The valid claim is:
+可以成立的表述是：
 
-> A projection can preserve the selected marginal at the snapshot instant,
-> while narrowing the consumer contract and data set.
+> 状态投影可以在快照时刻保持所选边缘量不变，同时收窄消费者契约和数据规模。
 
-It is not:
+不能直接成立的表述是：
 
-> Replacing the estimator with the projection is accuracy-neutral under all
-> future predictions.
+> 用投影替代原估计器后，所有未来预测都必然零精度损失。
 
-## Reference measurements
+## 参考性能数据
 
-These results are reference measurements from one host, not portability or
-worst-case guarantees.
+以下结果来自单台主机，仅作为参考，不代表跨平台保证，也不代表最坏情况。
 
-### Standalone library
+### 独立库
 
-Apple M1 ARM64, macOS 26.4.1, Apple Clang 21, Release (`-O3`), three runs.
-The payload was 8 `double` values plus a 64-element covariance array. Values
-are P95 per operation.
+环境为 Apple M1 ARM64、macOS 26.4.1、Apple Clang 21、Release（`-O3`），连续运行三次。负载状态包含 8 个 `double` 状态量和 64 个协方差元素。下表为每次操作的 P95。
 
-| Operation | P95 |
+| 操作 | P95 |
 | --- | ---: |
-| timeline record | 0.125-0.209 us |
-| exact history query | 0.042 us |
-| interpolated history | 0.042 us |
-| prediction +50 ms | 0.042 us |
-| shared snapshot publish | 0.167 us |
-| atomic latest read | 0.042 us |
-| causal control prediction | 0.042 us |
+| 时间轴记录 | 0.125-0.209 us |
+| 精确历史查询 | 0.042 us |
+| 插值历史查询 | 0.042 us |
+| +50 ms 预测 | 0.042 us |
+| 共享快照发布 | 0.167 us |
+| 原子 latest 读取 | 0.042 us |
+| 因果控制预测 | 0.042 us |
 
-The timer resolution was about 41.7 ns, so values near 0.042 us mean "one to
-two timer ticks" rather than an exact hardware latency.
+计时器分辨率约为 41.7 ns，因此 0.042 us 附近的结果表示“一到两个计时器刻度”，不应被解释为精确到纳秒的硬件延迟。
 
-### Exploratory C++ tracking-stack A/B
+### C++ 跟踪系统探索性 A/B
 
-A separate shadow adaptation was run against an existing 11-state target
-estimator. It was not vendored into this repository and did not replace the
-system's estimator or control output. The existing command mailbox copied a
-container of targets under a mutex; the experimental path published one
-immutable payload.
+我们曾在独立影子分支中接入一个现有的 11 维目标估计器。该实验没有把任何项目代码合并到本仓库，也没有替换原系统的估计器或控制输出。旧控制邮箱在 mutex 下拷贝目标容器，实验路径则发布一个不可变载荷。
 
-Apple M1 ARM64, Release, three runs, P95:
+环境为 Apple M1 ARM64、Release，连续运行三次，P95：
 
-| Operation | Existing mutex/copy path | Immutable snapshot path |
+| 操作 | 原 mutex + 拷贝路径 | 不可变快照路径 |
 | --- | ---: | ---: |
-| command publish | 1.17-1.67 us | 0.625 us |
-| command consume | 0.67-0.79 us | 0.042 us |
+| 控制消息发布 | 1.17-1.67 us | 0.625 us |
+| 控制消息读取 | 0.67-0.79 us | 0.042 us |
 
-The adapter plus full-covariance state record cost 0.334 us P95 on the same
-experimental setup. The control handoff therefore saved roughly 1-2 us per
-publication/read pair, primarily by removing the consumer-side deep copy.
+同一实验环境中，适配器加完整协方差状态记录的开销为 P95 0.334 us。控制交接每完成一次发布和读取，大约节省 1-2 us，主要来自消除读取方的深拷贝。
 
-At a 500 Hz loop, the period is 2 ms. Saving 1-2 us is less than 0.1% of the
-period and does **not** materially increase control frequency. The useful gain
-is deterministic temporal provenance and a cheaper multi-reader contract; the
-timing gain matters only when a handoff sits in a much tighter hot path.
+在 500 Hz 控制环中，周期为 2 ms。节省 1-2 us 不到周期的 0.1%，**不会明显提高控制频率**。真正的收益是确定性的时间来源和更轻的多读取方契约；只有交接位于更紧的热路径时，这部分延迟收益才更值得关注。
 
-These measurements do not establish improved tracking or firing accuracy.
+这些数据不能用于证明跟踪精度或火控精度得到提升。
 
-## Build, test, and benchmark
+## 构建、测试与基准
 
 ```bash
 cmake -S . -B build \
@@ -423,18 +335,15 @@ ctest --test-dir build --output-on-failure
 ./build/unified_state_basic_example
 ```
 
-The test suite covers invalid time and clock domains, monotonic recording,
-session isolation, bounded history, offline and causal availability,
-interpolation gaps, prediction horizons, reset epochs, single-writer
-publication, and concurrent reader integrity.
+测试覆盖非法时间和时钟域、单调记录、会话隔离、有界历史、离线与因果可用性、插值间隔、预测视界、reset epoch、单写发布和并发读取一致性。
 
-The implementation has also been exercised with:
+实现还通过了以下检查：
 
-- AddressSanitizer and UndefinedBehaviorSanitizer;
-- ThreadSanitizer;
-- `-Wall -Wextra -Wpedantic -Werror`.
+- AddressSanitizer 和 UndefinedBehaviorSanitizer；
+- ThreadSanitizer；
+- `-Wall -Wextra -Wpedantic -Werror`。
 
-## Install and consume with CMake
+## 通过 CMake 安装和使用
 
 ```bash
 cmake --install build --prefix /path/to/prefix
@@ -445,10 +354,7 @@ find_package(unified_state CONFIG REQUIRED)
 target_link_libraries(my_target PRIVATE unified_state::unified_state)
 ```
 
-The package is header-only and exports its C++17 and thread-library
-requirements. A minimal installation consumer is available in
-[`tests/consumer/CMakeLists.txt`](tests/consumer/CMakeLists.txt), and a runnable
-example is in [`examples/basic.cpp`](examples/basic.cpp).
+本库为纯头文件实现，CMake 包配置会自动导出 C++17 和 Threads 依赖。最小安装消费示例位于 [`tests/consumer/CMakeLists.txt`](tests/consumer/CMakeLists.txt)，可运行示例位于 [`examples/basic.cpp`](examples/basic.cpp)。
 
 ```cpp
 #include <unified_state/timeline.hpp>
@@ -463,33 +369,29 @@ update.state = estimate;
 update.measurement_backed = observed;
 
 if (const auto result = timeline.record(std::move(update)); !result) {
-    // Log result.error and handle the contract violation.
+    // 记录 result.error 并处理契约错误。
 }
 ```
 
-## Non-goals
+## 非目标
 
-Unified State does not provide:
+Unified State 不提供：
 
-- sensor fusion or an estimator implementation;
-- data association or physical-slot arbitration;
-- coordinate transforms or time synchronization;
-- a universal identity for a detector class or armor number;
-- yaw wrapping or covariance invariants without a caller policy;
-- hard-real-time allocation guarantees;
-- a networking, serialization, or storage protocol;
-- a fire-control safety decision.
+- 传感器融合或估计器实现；
+- 数据关联或物理装甲槽位仲裁；
+- 坐标变换或时间同步；
+- 检测类别、装甲编号等业务 ID 的通用身份定义；
+- 不依赖调用方策略的 yaw 归一化或协方差约束；
+- 硬实时内存分配保证；
+- 网络、序列化或存储协议；
+- 火控安全门或开火决策。
 
-The default history uses `std::deque` and can allocate while growing. A
-fixed-capacity ring-buffer implementation is a reasonable future addition for
-hard-real-time deployments.
+默认历史容器使用 `std::deque`，扩容时可能发生动态分配。对于硬实时部署，后续可以增加固定容量环形缓冲实现。
 
-## API stability
+## API 稳定性
 
-The current API is version `0.1.0`. Until `1.0`, source compatibility may change
-as adapters and non-functional requirements expose better names or boundaries.
+当前版本为 `0.1.0`。在 `1.0` 之前，随着真实适配和非功能需求暴露更准确的命名或边界，源码兼容性仍可能变化。
 
-## License
+## 许可证
 
-The license has not yet been selected for this source release. Add an explicit
-SPDX-compatible license before publishing the repository as open source.
+本次源码发布尚未选择许可证。正式作为开源仓库发布前，需要由版权所有者确定许可证并添加符合 SPDX 约定的 `LICENSE` 文件。
